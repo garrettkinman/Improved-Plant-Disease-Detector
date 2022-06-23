@@ -76,19 +76,21 @@ test_dataset = ImageDataContainer(test_df, test_dir)
 train_loader = DataLoader(train_dataset, batchsize=128)
 test_loader = DataLoader(test_dataset, batchsize=128)
 
-@time for (batch_X, batch_y) ∈ test_loader
-    println(typeof(batch_X))
+@time for (imgs, labels) ∈ test_loader
+    # convert to 256×256×3×128 array (Height×Width×Color×Number) of floats (values between 0.0 and 1.0) on the GPU
+    batch_X = @pipe hcat(imgs...) |> reshape(_, (256, 256, length(labels))) |> channelview |> permutedims(_, (2, 3, 1, 4)) |> float32.(_) |> gpu
+    batch_y = labels |> gpu
 end
 
-typeof(1:3)
+## resnet transfer learning baseline model
+
+
 
 batch_X, batch_y = getindex(train_dataset, 1:2)
 
-typeof(batch_X)
 
-# this converts 256×256 matrix of RGB pixels into 256×256×3 array
-@pipe batch_X[1] |> channelview |> permutedims(_, (2, 3, 1))
-
-Threads.nthreads()
-
-# TODO: a batch should be a 256×256×3×128 array
+batch = @pipe hcat(batch_X...) |> reshape(_, (256, 256, length(batch_y))) |> channelview |> permutedims(_, (2, 3, 1, 4)) |> float32.(_)
+gpu(batch)
+typeof(batch)
+batch[:,:,:,1]
+colorview(RGB, permutedims(batch[:, :, :, 1], (3, 1, 2)))
