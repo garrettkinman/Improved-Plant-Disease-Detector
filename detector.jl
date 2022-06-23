@@ -10,6 +10,8 @@ using DataFrames
 using MLUtils
 using ProgressMeter
 using Pipe
+using BSON
+using BenchmarkTools
 
 ## data container implementation
 
@@ -78,16 +80,26 @@ test_loader = DataLoader(test_dataset, batchsize=128)
 
 @time for (imgs, labels) ∈ test_loader
     # convert to 256×256×3×128 array (Height×Width×Color×Number) of floats (values between 0.0 and 1.0) on the GPU
-    batch_X = @pipe hcat(imgs...) |> reshape(_, (256, 256, length(labels))) |> channelview |> permutedims(_, (2, 3, 1, 4)) |> float32.(_) |> gpu
-    batch_y = labels |> gpu
+    # arrays are sent to gpu at optimal time based on benchmark performance
+    batch_X = @pipe hcat(imgs...) |> reshape(_, (256, 256, length(labels))) |> gpu |> channelview |> permutedims(_, (2, 3, 1, 4)) |> float32.(_)
+    batch_y = @pipe labels |> gpu |> float32.(_)
 end
 
 ## resnet transfer learning baseline model
 
+resnet_path = joinpath(@__DIR__, "resnet18.bson")
+BSON.load(resnet_path)
 
+resnet = ResNet(18, pretrain=true)
+resnet.layers
+# baseline_model = Chain(resnet.layers,)
+
+BSON.load("resnet18.tar")
+
+Flux.loadmodel!(resnet, )
 
 batch_X, batch_y = getindex(train_dataset, 1:2)
-
+float32.(batch_y)
 
 batch = @pipe hcat(batch_X...) |> reshape(_, (256, 256, length(batch_y))) |> channelview |> permutedims(_, (2, 3, 1, 4)) |> float32.(_)
 gpu(batch)
