@@ -63,6 +63,12 @@ function Base.getindex(dataset::ImageDataContainer, idxs::UnitRange)
     return (batch_imgs, batch_labels)
 end
 
+## declare constants
+
+N_CLASSES = 2
+HEIGHT, WIDTH, CHANNELS = 256, 256, 3
+BATCH_SIZE = 128
+
 ## create data containers and dataloaders
 
 dataset_dir = "load_dataset/dataset/"
@@ -75,28 +81,34 @@ test_df = DataFrame(CSV.File(dataset_dir * "test_labels.csv"))
 train_dataset = ImageDataContainer(train_df, train_dir)
 test_dataset = ImageDataContainer(test_df, test_dir)
 
-train_loader = DataLoader(train_dataset, batchsize=128)
-test_loader = DataLoader(test_dataset, batchsize=128)
+train_loader = DataLoader(train_dataset, batchsize=BATCH_SIZE)
+test_loader = DataLoader(test_dataset, batchsize=BATCH_SIZE)
 
 @time for (imgs, labels) ∈ test_loader
     # convert to 256×256×3×128 array (Height×Width×Color×Number) of floats (values between 0.0 and 1.0) on the GPU
     # arrays are sent to gpu at optimal time based on benchmark performance
-    batch_X = @pipe hcat(imgs...) |> reshape(_, (256, 256, length(labels))) |> gpu |> channelview |> permutedims(_, (2, 3, 1, 4)) |> float32.(_)
+    batch_X = @pipe hcat(imgs...) |> reshape(_, (HEIGHT, WIDTH, length(labels))) |> gpu |> channelview |> permutedims(_, (2, 3, 1, 4)) |> float32.(_)
     batch_y = @pipe labels |> gpu |> float32.(_)
 end
 
 ## resnet transfer learning baseline model
 
-resnet_path = joinpath(@__DIR__, "resnet18.bson")
-BSON.load(resnet_path)
+# load in saved params from bson
+resnet = ResNet(18)
+@pipe joinpath(@__DIR__, "resnet18.bson") |> BSON.load(_)[:model] |> Flux.loadmodel!(resnet, _)
 
-resnet = ResNet(18, pretrain=true)
 resnet.layers
-# baseline_model = Chain(resnet.layers,)
 
-BSON.load("resnet18.tar")
+resnet.layers[end][end]
 
-Flux.loadmodel!(resnet, )
+baseline_model = Chain(
+    resnet.layers[1:end-1],
+    Chain(
+        AdaptiveMeanPool((1, 1)),
+        MLUtils.flatten,
+        Dense(512 => 2)
+    )
+)
 
 batch_X, batch_y = getindex(train_dataset, 1:2)
 float32.(batch_y)
