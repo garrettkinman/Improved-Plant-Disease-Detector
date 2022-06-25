@@ -2,7 +2,7 @@
 
 using Flux
 using Flux: Data.DataLoader
-using Flux: Losses.logitcrossentropy
+using Flux: Losses.logitbinarycrossentropy
 using Flux: @epochs
 using Metalhead
 using Images
@@ -53,7 +53,7 @@ end
 # end
 
 "Gets the i-th to j-th observations (including labels) for a given dataset."
-function Base.getindex(dataset::ImageDataContainer, idxs::UnitRange)
+function Base.getindex(dataset::ImageDataContainer, idxs::Union{UnitRange,Vector})
     batch_imgs = map(idx -> load(dataset.filenames[idx]), idxs)
     batch_labels = map(idx -> dataset.labels[idx], idxs)
 
@@ -82,14 +82,104 @@ dataset_dir = "load_dataset/dataset/"
 train_dir = dataset_dir * "train/"
 test_dir = dataset_dir * "test/"
 
+# dataframes containing filenames for images and corresponding labels
 train_df = DataFrame(CSV.File(dataset_dir * "train_labels.csv"))
 test_df = DataFrame(CSV.File(dataset_dir * "test_labels.csv"))
 
+# ImageDataContainer wrappers for dataframes
+# gives interface for getting the actual images and labels as tensors
 train_dataset = ImageDataContainer(train_df, train_dir)
 test_dataset = ImageDataContainer(test_df, test_dir)
 
-train_loader = DataLoader(train_dataset, batchsize=BATCH_SIZE)
+# randomly sort train dataset into training and validation sets
+train_set, val_set = splitobs(train_dataset, at=0.7, shuffle=true)
+
+train_loader = DataLoader(train_set, batchsize=BATCH_SIZE, shuffle=true)
+val_loader = DataLoader(val_set, batchsize=BATCH_SIZE, shuffle=true)
 test_loader = DataLoader(test_dataset, batchsize=BATCH_SIZE)
+
+## training loop
+
+@time for (X, y) ∈ val_loader
+    println(size(X), size(y))
+    println(typeof(X), typeof(y))
+end
+
+"Stores the history through all the epochs of key training/validation performance metrics."
+mutable struct TrainingMetrics
+    train_acc::Vector{AbstractFloat}
+    train_loss::Vector{AbstractFloat}
+    val_acc::Vector{AbstractFloat}
+    val_loss::Vector{AbstractFloat}
+
+    TrainingMetrics(n_epochs::Integer) = new(zeros(n_epochs), zeros(n_epochs), zeros(n_epochs), zeros(n_epochs))
+end
+
+function train(model, n_epochs::Integer)
+    model = model |> gpu
+    optimizer = ADAM()
+    params = Flux.params(model)
+
+    metrics = TrainingMetrics(n_epochs)
+
+    # zero init performance measures for epoch
+    acc = 0.0
+    loss = 0.0
+
+    # so we can automatically save the model with best val accuracy
+    best_acc = 0.0
+
+    # X and y are already in the right shape and on the gpu
+    # if they weren't, Zygote.jl would throw a fit because it needs to be able to differentiate this function
+    function loss_func(X, y)
+        ŷ = model(X)
+        batch_loss = logitbinarycrossentropy(ŷ, y)
+
+        # this is not ideal design, but I'm not sure how else to calculate training accuracies
+        # besides using this loss function
+        batch_acc = @pipe ((((σ.(ŷ) .> 0.5) .* 1.0) .== y) .* 1.0) |> cpu |> reduce(+, _)
+        acc += batch_acc
+        loss += (batch_loss |> cpu)
+
+        return batch_loss
+    end
+
+    @info "Beginning training loop..."
+    @showprogress for epoch_idx ∈ 1:n_epochs
+        @info "Training epoch $(epoch_idx)..."
+        # train 1 epoch, record performance
+        Flux.train!(loss_func, params, train_loader, optimizer)
+        metrics.train_acc[epoch_idx] = acc / length(train_set)
+        metrics.train_loss[epoch_idx] = loss / length(train_set)
+
+        # reset variables
+        acc = 0.0
+        loss = 0.0
+
+        @info "Validating epoch $(epoch_idx)..."
+        # val 1 epoch, record performance
+        for (X, y) ∈ val_loader
+            batch_loss = loss_func(X, y)
+        end
+        # add acc and loss to lists
+        metrics.val_acc[epoch_idx] = acc / length(val_set)
+        metrics.val_loss[epoch_idx] = loss / length(val_set)
+
+        # automatically save the model every time it improves in val accuracy
+        if metrics.val_acc[epoch_idx] >= best_acc
+            @info "New best accuracy: $(metrics.val_acc[epoch_idx])! Saving model out to baseline.bson"
+            BSON.@save joinpath(@__DIR__, "baseline.bson")
+            best_acc = metrics.val_acc[epoch_idx]
+        end
+
+        # reset variables
+        acc = 0.0
+        loss = 0.0
+    end
+
+    # @epochs n_epochs Flux.train!(loss, params, train_loader, optimizer)
+    return model, metrics
+end
 
 ## resnet transfer learning baseline model
 
@@ -107,30 +197,10 @@ baseline_model = Chain(
         MLUtils.flatten,
         Dense(512 => N_CLASSES)
     )
-) |> gpu
+)
 
-## training loop
+@time train(baseline_model, 50)
 
-for (X, y) ∈ test_loader
-    # @time X, y = transform_batch(imgs, labels)
-    println(size(X), size(y))
-    println(typeof(X), typeof(y))
+@showprogress for i ∈ 1:50
+    sleep(0.1)
 end
-
-function train(model, n_epochs)
-    model = model
-    optimizer = ADAM()
-    params = Flux.params(model)
-
-    # X and y are already in the right shape and on the gpu
-    # if they weren't, Zygote.jl would throw a fit because it needs to be able to differentiate this function
-    function loss(X, y)
-        ŷ = model(X)
-        return logitcrossentropy(ŷ, y)
-    end
-
-    @epochs n_epochs Flux.train!(loss, params, train_loader, optimizer)
-    return model
-end
-
-train(baseline_model, 2)
