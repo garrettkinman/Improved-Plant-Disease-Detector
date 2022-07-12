@@ -11,6 +11,7 @@ using CSV
 using DataFrames
 using MLUtils
 using ProgressMeter
+using ProgressLogging
 using Pipe
 using BSON
 using BenchmarkTools
@@ -60,9 +61,9 @@ function Base.getindex(dataset::ImageDataContainer, idxs::Union{UnitRange,Vector
     "Applies necessary transforms and reshapings to batches and loads them onto GPU to be fed into a model."
     function transform_batch(imgs, labels)
         # convert imgs to 256×256×3×128 array (Height×Width×Color×Number) of floats (values between 0.0 and 1.0) on the gpu
-        # arrays are sent to gpu at optimal time based on benchmark performance
-        batch_X = @pipe hcat(imgs...) |> reshape(_, (HEIGHT, WIDTH, length(labels))) |> gpu |> channelview |> permutedims(_, (2, 3, 1, 4)) |> float32.(_)
-        batch_y = @pipe labels |> reshape(_, (1, length(labels))) |> gpu |> float32.(_)
+        # arrays need to be sent to gpu inside training loop for garbage collector to work
+        batch_X = @pipe hcat(imgs...) |> reshape(_, (HEIGHT, WIDTH, length(labels))) |> channelview |> permutedims(_, (2, 3, 1, 4))
+        batch_y = @pipe labels |> reshape(_, (1, length(labels)))
 
         return (batch_X, batch_y)
     end
@@ -100,11 +101,6 @@ test_loader = DataLoader(test_dataset, batchsize=BATCH_SIZE)
 
 ## training loop
 
-@time for (X, y) ∈ val_loader
-    println(size(X), size(y))
-    println(typeof(X), typeof(y))
-end
-
 "Stores the history through all the epochs of key training/validation performance metrics."
 mutable struct TrainingMetrics
     train_acc::Vector{AbstractFloat}
@@ -115,6 +111,7 @@ mutable struct TrainingMetrics
     TrainingMetrics(n_epochs::Integer) = new(zeros(n_epochs), zeros(n_epochs), zeros(n_epochs), zeros(n_epochs))
 end
 
+"Trains given model for a given number of epochs and saves the model that performs best on the validation set."
 function train(model, n_epochs::Integer)
     model = model |> gpu
     optimizer = ADAM()
@@ -148,7 +145,16 @@ function train(model, n_epochs::Integer)
     @showprogress for epoch_idx ∈ 1:n_epochs
         @info "Training epoch $(epoch_idx)..."
         # train 1 epoch, record performance
-        Flux.train!(loss_func, params, train_loader, optimizer)
+        @withprogress for (batch_idx, (imgs, labels)) ∈ enumerate(train_loader)
+            X = @pipe imgs |> gpu |> float32.(_)
+            y = @pipe labels |> gpu |> float32.(_)
+
+            gradients = gradient(() -> loss_func(X, y), params)
+            Flux.Optimise.update!(optimizer, params, gradients)
+
+            @logprogress batch_idx / length(enumerate(train_loader))
+        end
+        # Flux.train!(loss_func, params, train_loader, optimizer)
         metrics.train_acc[epoch_idx] = acc / length(train_set)
         metrics.train_loss[epoch_idx] = loss / length(train_set)
 
@@ -158,8 +164,12 @@ function train(model, n_epochs::Integer)
 
         @info "Validating epoch $(epoch_idx)..."
         # val 1 epoch, record performance
-        for (X, y) ∈ val_loader
+        @withprogress for (batch_idx, (imgs, labels)) ∈ enumerate(val_loader)
+            X = @pipe imgs |> gpu |> float32.(_)
+            y = @pipe labels |> gpu |> float32.(_)
             batch_loss = loss_func(X, y)
+
+            @logprogress batch_idx / length(enumerate(val_loader))
         end
         # add acc and loss to lists
         metrics.val_acc[epoch_idx] = acc / length(val_set)
@@ -199,8 +209,4 @@ baseline_model = Chain(
     )
 )
 
-@time train(baseline_model, 50)
-
-@showprogress for i ∈ 1:50
-    sleep(0.1)
-end
+@time train(baseline_model, 10)
