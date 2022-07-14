@@ -5,6 +5,7 @@ using Flux: Data.DataLoader
 using Flux: Losses.logitbinarycrossentropy
 using Flux: @epochs
 using Metalhead
+using CUDA
 using Images
 using FileIO
 using CSV
@@ -15,6 +16,7 @@ using ProgressLogging
 using Pipe
 using BSON
 using BenchmarkTools
+using Plots
 
 ## data container implementation
 
@@ -40,18 +42,6 @@ end
 function Base.length(dataset::ImageDataContainer)
     return length(dataset.labels)
 end
-
-# "Gets the i-th observation (including label) for a given dataset."
-# function Base.getindex(dataset::ImageDataContainer, idx::Integer)
-#     if idx > length(dataset)
-#         throw(ArgumentError("The dataset is not that large!"))
-#     else
-#         img = load(dataset.filenames[idx])
-#         label = dataset.labels[idx]
-
-#         return (img, label)
-#     end
-# end
 
 "Gets the i-th to j-th observations (including labels) for a given dataset."
 function Base.getindex(dataset::ImageDataContainer, idxs::Union{UnitRange,Vector})
@@ -103,12 +93,10 @@ test_loader = DataLoader(test_dataset, batchsize=BATCH_SIZE)
 
 "Stores the history through all the epochs of key training/validation performance metrics."
 mutable struct TrainingMetrics
-    train_acc::Vector{AbstractFloat}
-    train_loss::Vector{AbstractFloat}
     val_acc::Vector{AbstractFloat}
     val_loss::Vector{AbstractFloat}
 
-    TrainingMetrics(n_epochs::Integer) = new(zeros(n_epochs), zeros(n_epochs), zeros(n_epochs), zeros(n_epochs))
+    TrainingMetrics(n_epochs::Integer) = new(zeros(n_epochs), zeros(n_epochs))
 end
 
 "Trains given model for a given number of epochs and saves the model that performs best on the validation set."
@@ -120,60 +108,54 @@ function train(model, n_epochs::Integer)
     metrics = TrainingMetrics(n_epochs)
 
     # zero init performance measures for epoch
-    acc = 0.0
-    loss = 0.0
+    epoch_acc = 0.0
+    epoch_loss = 0.0
 
     # so we can automatically save the model with best val accuracy
     best_acc = 0.0
 
     # X and y are already in the right shape and on the gpu
     # if they weren't, Zygote.jl would throw a fit because it needs to be able to differentiate this function
-    function loss_func(X, y)
-        ŷ = model(X)
-        batch_loss = logitbinarycrossentropy(ŷ, y)
-
-        # this is not ideal design, but I'm not sure how else to calculate training accuracies
-        # besides using this loss function
-        batch_acc = @pipe ((((σ.(ŷ) .> 0.5) .* 1.0) .== y) .* 1.0) |> cpu |> reduce(+, _)
-        acc += batch_acc
-        loss += (batch_loss |> cpu)
-
-        return batch_loss
-    end
+    loss(X, y) = logitbinarycrossentropy(model(X), y)
 
     @info "Beginning training loop..."
-    @showprogress for epoch_idx ∈ 1:n_epochs
+    for epoch_idx ∈ 1:n_epochs
         @info "Training epoch $(epoch_idx)..."
         # train 1 epoch, record performance
         @withprogress for (batch_idx, (imgs, labels)) ∈ enumerate(train_loader)
             X = @pipe imgs |> gpu |> float32.(_)
             y = @pipe labels |> gpu |> float32.(_)
 
-            gradients = gradient(() -> loss_func(X, y), params)
+            gradients = gradient(() -> loss(X, y), params)
             Flux.Optimise.update!(optimizer, params, gradients)
 
             @logprogress batch_idx / length(enumerate(train_loader))
         end
-        # Flux.train!(loss_func, params, train_loader, optimizer)
-        metrics.train_acc[epoch_idx] = acc / length(train_set)
-        metrics.train_loss[epoch_idx] = loss / length(train_set)
 
         # reset variables
-        acc = 0.0
-        loss = 0.0
+        epoch_acc = 0.0
+        epoch_loss = 0.0
 
         @info "Validating epoch $(epoch_idx)..."
         # val 1 epoch, record performance
         @withprogress for (batch_idx, (imgs, labels)) ∈ enumerate(val_loader)
             X = @pipe imgs |> gpu |> float32.(_)
             y = @pipe labels |> gpu |> float32.(_)
-            batch_loss = loss_func(X, y)
+
+            # feed through the model to create prediction
+            ŷ = model(X)
+
+            # calculate the loss and accuracy for this batch, add to accumulator for epoch results
+            batch_acc = @pipe ((((σ.(ŷ) .> 0.5) .* 1.0) .== y) .* 1.0) |> cpu |> reduce(+, _)
+            epoch_acc += batch_acc
+            batch_loss = loss(X, y)
+            epoch_loss += (batch_loss |> cpu)
 
             @logprogress batch_idx / length(enumerate(val_loader))
         end
         # add acc and loss to lists
-        metrics.val_acc[epoch_idx] = acc / length(val_set)
-        metrics.val_loss[epoch_idx] = loss / length(val_set)
+        metrics.val_acc[epoch_idx] = epoch_acc / length(val_set)
+        metrics.val_loss[epoch_idx] = epoch_loss / length(val_set)
 
         # automatically save the model every time it improves in val accuracy
         if metrics.val_acc[epoch_idx] >= best_acc
@@ -181,13 +163,8 @@ function train(model, n_epochs::Integer)
             BSON.@save joinpath(@__DIR__, "baseline.bson")
             best_acc = metrics.val_acc[epoch_idx]
         end
-
-        # reset variables
-        acc = 0.0
-        loss = 0.0
     end
 
-    # @epochs n_epochs Flux.train!(loss, params, train_loader, optimizer)
     return model, metrics
 end
 
@@ -209,4 +186,8 @@ baseline_model = Chain(
     )
 )
 
-@time train(baseline_model, 10)
+baseline_model, metrics = @time train(baseline_model, 10)
+
+plot(metrics.val_acc, legend=false)
+xlabel!("Epoch")
+ylabel!("Validation Accuracy")
