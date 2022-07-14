@@ -188,6 +188,10 @@ baseline_model = Chain(
 
 baseline_model, metrics = @time train(baseline_model, 10)
 
-plot(metrics.val_acc, legend=false)
+plot(metrics.val_acc, label="resnet18 baseline")
 xlabel!("Epoch")
 ylabel!("Validation Accuracy")
+title!("Validation Accuracy vs Epochs")
+savefig("baseline_val_accuracy.png")
+
+## custom twin-network model
