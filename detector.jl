@@ -186,12 +186,141 @@ baseline_model = Chain(
     )
 )
 
-baseline_model, metrics = @time train(baseline_model, 10)
+baseline_model, baseline_metrics = @time train(baseline_model, 10)
 
-plot(metrics.val_acc, label="resnet18 baseline")
+plot(baseline_metrics.val_acc, label="resnet18 baseline")
 xlabel!("Epoch")
 ylabel!("Validation Accuracy")
 title!("Validation Accuracy vs Epochs")
 savefig("baseline_val_accuracy.png")
 
 ## custom twin-network model
+
+# need two dataloaders for each stage, as need two images to feed into the twin network model
+train_loader₁ = DataLoader(train_set, batchsize=BATCH_SIZE, shuffle=true)
+train_loader₂ = DataLoader(train_set, batchsize=BATCH_SIZE, shuffle=true)
+val_loader₁ = DataLoader(val_set, batchsize=BATCH_SIZE, shuffle=true)
+val_loader₂ = DataLoader(val_set, batchsize=BATCH_SIZE, shuffle=true)
+test_loader₁ = DataLoader(test_dataset, batchsize=BATCH_SIZE, shuffle=true)
+test_loader₂ = DataLoader(test_dataset, batchsize=BATCH_SIZE, shuffle=true)
+
+"Custom Flux NN layer which will create twin network from `path` with shared parameters and combine their output with `combine`."
+struct Twin{T,F}
+    combine::F
+    path::T
+end
+
+# define the forward pass of the Twin layer
+# feeds both inputs, X, through the same path (i.e., shared parameters)
+# and combines their outputs
+Flux.@functor Twin
+(m::Twin)(Xs::Tuple) = m.combine(map(X -> m.path(X), Xs)...)
+
+# this is the architecture that forms the path of the twin network
+CNN_path = Chain(
+    # layer 1
+    Conv((5,5), 3 => 18, relu),
+    MaxPool((3,3), stride=3),
+    # layer 2
+    Conv((5,5), 18 => 36, relu),
+    MaxPool((2,2), stride=2),
+    # layer 3
+    Conv((3,3), 36 => 72, relu),
+    MaxPool((2,2), stride=2),
+    Flux.flatten,
+    # layer 4
+    Dense(19 * 19 * 72 => 64, relu),
+    # Dropout(0.1),
+    # output layer
+    Dense(64 => 32, relu)
+)
+
+# this layer combines the outputs of the twin CNNs
+bilinear = Flux.Bilinear((32,32) => 1)
+
+twin_model = Twin(bilinear, CNN_path)
+
+## training loop
+
+"Trains given model for a given number of epochs and saves the model that performs best on the validation set."
+function train_twin(model, n_epochs::Integer)
+    model = model |> gpu
+    optimizer = ADAM()
+    params = Flux.params(model)
+
+    metrics = TrainingMetrics(n_epochs)
+
+    # zero init performance measures for epoch
+    epoch_acc = 0.0
+    epoch_loss = 0.0
+
+    # so we can automatically save the model with best val accuracy
+    best_acc = 0.0
+
+    # X and y are already in the right shape and on the gpu
+    # if they weren't, Zygote.jl would throw a fit because it needs to be able to differentiate this function
+    loss(Xs, y) = logitbinarycrossentropy(model(Xs), y)
+
+    @info "Beginning training loop..."
+    for epoch_idx ∈ 1:n_epochs
+        @info "Training epoch $(epoch_idx)..."
+        # train 1 epoch, record performance
+        @withprogress for (batch_idx, ((imgs₁, labels₁), (imgs₂, labels₂))) ∈ enumerate(zip(train_loader₁, train_loader₂))
+            X₁ = @pipe imgs₁ |> gpu |> float32.(_)
+            y₁ = @pipe labels₁ |> gpu |> float32.(_)
+
+            X₂ = @pipe imgs₂ |> gpu |> float32.(_)
+            y₂ = @pipe labels₂ |> gpu |> float32.(_)
+
+            Xs = (X₁, X₂)
+            y = ((y₁ == y₂) .* 1.0) # y represents if both images have the same label
+
+            gradients = gradient(() -> loss(Xs, y), params)
+            Flux.Optimise.update!(optimizer, params, gradients)
+
+            @logprogress batch_idx / length(enumerate(train_loader₁))
+        end
+
+        # reset variables
+        epoch_acc = 0.0
+        epoch_loss = 0.0
+
+        @info "Validating epoch $(epoch_idx)..."
+        # val 1 epoch, record performance
+        @withprogress for (batch_idx, ((imgs₁, labels₁), (imgs₂, labels₂))) ∈ enumerate(zip(val_loader₁, val_loader₂))
+            X₁ = @pipe imgs₁ |> gpu |> float32.(_)
+            y₁ = @pipe labels₁ |> gpu |> float32.(_)
+
+            X₂ = @pipe imgs₂ |> gpu |> float32.(_)
+            y₂ = @pipe labels₂ |> gpu |> float32.(_)
+
+            Xs = (X₁, X₂)
+            y = ((y₁ == y₂) .* 1.0) # y represents if both images have the same label
+
+            # feed through the model to create prediction
+            ŷ = model(Xs)
+
+            # calculate the loss and accuracy for this batch, add to accumulator for epoch results
+            batch_acc = @pipe ((((σ.(ŷ) .> 0.5) .* 1.0) .== y) .* 1.0) |> cpu |> reduce(+, _)
+            epoch_acc += batch_acc
+            batch_loss = loss(Xs, y)
+            epoch_loss += (batch_loss |> cpu)
+
+            @logprogress batch_idx / length(enumerate(val_loader))
+        end
+        # add acc and loss to lists
+        metrics.val_acc[epoch_idx] = epoch_acc / length(val_set)
+        metrics.val_loss[epoch_idx] = epoch_loss / length(val_set)
+
+        # automatically save the model every time it improves in val accuracy
+        if metrics.val_acc[epoch_idx] >= best_acc
+            @info "New best accuracy: $(metrics.val_acc[epoch_idx])! Saving model out to twin.bson"
+            BSON.@save joinpath(@__DIR__, "twin.bson")
+            best_acc = metrics.val_acc[epoch_idx]
+        end
+    end
+
+    return model, metrics
+end
+
+twin_model, twin_metrics = @time train_twin(twin_model, 10)
