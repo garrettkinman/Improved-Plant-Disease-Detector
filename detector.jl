@@ -273,7 +273,7 @@ function train_twin(model, n_epochs::Integer)
             y₂ = @pipe labels₂ |> gpu |> float32.(_)
 
             Xs = (X₁, X₂)
-            y = ((y₁ == y₂) .* 1.0) # y represents if both images have the same label
+            y = ((y₁ .== y₂) .* 1.0) # y represents if both images have the same label
 
             gradients = gradient(() -> loss(Xs, y), params)
             Flux.Optimise.update!(optimizer, params, gradients)
@@ -295,7 +295,7 @@ function train_twin(model, n_epochs::Integer)
             y₂ = @pipe labels₂ |> gpu |> float32.(_)
 
             Xs = (X₁, X₂)
-            y = ((y₁ == y₂) .* 1.0) # y represents if both images have the same label
+            y = ((y₁ .== y₂) .* 1.0) # y represents if both images have the same label
 
             # feed through the model to create prediction
             ŷ = model(Xs)
@@ -303,7 +303,7 @@ function train_twin(model, n_epochs::Integer)
             # calculate the loss and accuracy for this batch, add to accumulator for epoch results
             batch_acc = @pipe ((((σ.(ŷ) .> 0.5) .* 1.0) .== y) .* 1.0) |> cpu |> reduce(+, _)
             epoch_acc += batch_acc
-            batch_loss = loss(Xs, y)
+            batch_loss = logitbinarycrossentropy(ŷ, y)
             epoch_loss += (batch_loss |> cpu)
 
             @logprogress batch_idx / length(enumerate(val_loader))
@@ -324,3 +324,9 @@ function train_twin(model, n_epochs::Integer)
 end
 
 twin_model, twin_metrics = @time train_twin(twin_model, 10)
+
+plot(twin_metrics.val_acc, label="twin network")
+xlabel!("Epoch")
+ylabel!("Validation Accuracy")
+title!("Validation Accuracy vs Epochs")
+savefig("twin_val_accuracy.png")
