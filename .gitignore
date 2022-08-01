@@ -1,4 +1,2 @@
-*.jpg
-*.JPG
-*.jpeg
-*.png
+load_dataset/dataset/test
+load_dataset/dataset/train
