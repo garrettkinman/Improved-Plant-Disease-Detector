@@ -1,4 +1,4 @@
 Model,Val Accuracy,Test Accuracy
-Resnet18 Baseline,97.3,TODO
-Twin CNN,95.4,TODO
-Twin Resnet18,94.6,TODO
+Resnet18 Baseline,97.3,69.6
+Twin CNN,95.4,55.9
+Twin Resnet18,94.6,61.0

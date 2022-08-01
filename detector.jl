@@ -351,3 +351,85 @@ xlabel!("Epoch")
 ylabel!("Validation Accuracy")
 title!("Validation Accuracy vs Epochs")
 savefig("twin_resnet_val_accuracy.png")
+
+## test
+
+function test(model)
+    model = model |> gpu
+
+    # zero init performance measures
+    avg_acc = 0.0
+    avg_loss = 0.0
+
+    @info "Beginning testing..."
+    @withprogress for (batch_idx, (imgs, labels)) ∈ enumerate(test_loader)
+        X = @pipe imgs |> gpu |> float32.(_)
+        y = @pipe labels |> gpu |> float32.(_)
+
+        # feed through the model to create prediction
+        ŷ = model(X)
+
+        # calculate the loss and accuracy for this batch, add to accumulator for total results
+        batch_acc = @pipe ((((σ.(ŷ) .> 0.5) .* 1.0) .== y) .* 1.0) |> cpu |> reduce(+, _)
+        avg_acc += batch_acc
+        batch_loss = logitbinarycrossentropy(ŷ, y)
+        avg_loss += (batch_loss |> cpu)
+
+        @logprogress batch_idx / length(enumerate(test_loader))
+    end
+    # add acc and loss to lists
+    avg_acc = avg_acc / length(test_dataset)
+    avg_loss = avg_loss / length(test_dataset)
+
+    return avg_acc, avg_loss
+end
+
+function test(model::Twin)
+    model = model |> gpu
+
+    # zero init performance measures
+    avg_acc = 0.0
+    avg_loss = 0.0
+
+    @info "Beginning testing..."
+    @withprogress for (batch_idx, ((imgs₁, labels₁), (imgs₂, labels₂))) ∈ enumerate(zip(test_loader₁, test_loader₂))
+        X₁ = @pipe imgs₁ |> gpu |> float32.(_)
+        y₁ = @pipe labels₁ |> gpu |> float32.(_)
+
+        X₂ = @pipe imgs₂ |> gpu |> float32.(_)
+        y₂ = @pipe labels₂ |> gpu |> float32.(_)
+
+        Xs = (X₁, X₂)
+        y = ((y₁ .== y₂) .* 1.0) # y represents if both images have the same label
+
+        # feed through the model to create prediction
+        ŷ = model(Xs)
+
+        # calculate the loss and accuracy for this batch, add to accumulator for total results
+        batch_acc = @pipe ((((σ.(ŷ) .> 0.5) .* 1.0) .== y) .* 1.0) |> cpu |> reduce(+, _)
+        avg_acc += batch_acc
+        batch_loss = logitbinarycrossentropy(ŷ, y)
+        avg_loss += (batch_loss |> cpu)
+
+        @logprogress batch_idx / length(enumerate(test_loader))
+    end
+    # add acc and loss to lists
+    avg_acc = avg_acc / length(test_dataset)
+    avg_loss = avg_loss / length(test_dataset)
+
+    return avg_acc, avg_loss
+end
+
+baseline_test_acc, baseline_test_loss = test(baseline_model)
+twin_cnn_test_acc, twin_cnn_test_loss = test(twin_model)
+twin_resnet_test_acc, twin_resnet_test_loss = test(twin_resnet)
+
+## plot all validation results
+
+plot(baseline_metrics.val_acc, label="resnet baseline")
+plot!(twin_metrics.val_acc, label="twin cnn")
+plot!(twin_resnet_metrics.val_acc, label="twin resnet")
+xlabel!("Epoch")
+ylabel!("Validation Accuracy")
+title!("Validation Accuracy vs Epochs")
+savefig("val_accuracy.png")
