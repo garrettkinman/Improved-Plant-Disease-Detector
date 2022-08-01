@@ -100,7 +100,7 @@ mutable struct TrainingMetrics
 end
 
 "Trains given model for a given number of epochs and saves the model that performs best on the validation set."
-function train(model, n_epochs::Integer, filename::String)
+function train!(model, n_epochs::Integer, filename::String)
     model = model |> gpu
     optimizer = ADAM()
     params = Flux.params(model[end]) # transfer learning, so only training last layers
@@ -186,7 +186,7 @@ baseline_model = Chain(
     )
 )
 
-baseline_model, baseline_metrics = @time train(baseline_model, 10, "baseline")
+baseline_model, baseline_metrics = @time train!(baseline_model, 10, "baseline")
 
 plot(baseline_metrics.val_acc, label="resnet18 baseline")
 xlabel!("Epoch")
@@ -242,7 +242,7 @@ twin_model = Twin(
 ## training loop
 
 "Trains given twin model for a given number of epochs and saves the model that performs best on the validation set."
-function train(model::Twin, n_epochs::Integer, filename::String; is_resnet::Bool=false)
+function train!(model::Twin, n_epochs::Integer, filename::String; is_resnet::Bool=false)
     model = model |> gpu
     optimizer = ADAM()
     params = is_resnet ? Flux.params(model.path[end:end], model.combine) : Flux.params(model) # if custom CNN, need to train all params
@@ -322,7 +322,7 @@ function train(model::Twin, n_epochs::Integer, filename::String; is_resnet::Bool
     return model, metrics
 end
 
-twin_model, twin_metrics = @time train(twin_model, 10, "twin_cnn")
+twin_model, twin_metrics = @time train!(twin_model, 10, "twin_cnn")
 
 plot(twin_metrics.val_acc, label="twin cnn")
 xlabel!("Epoch")
@@ -344,7 +344,7 @@ twin_resnet = Twin(
     )
 )
 
-twin_resnet, twin_resnet_metrics = @time train(twin_resnet, 10, "twin_resnet", is_resnet=true)
+twin_resnet, twin_resnet_metrics = @time train!(twin_resnet, 10, "twin_resnet", is_resnet=true)
 
 plot(twin_resnet_metrics.val_acc, label="twin resnet")
 xlabel!("Epoch")
