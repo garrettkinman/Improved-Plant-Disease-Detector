@@ -63,31 +63,31 @@ end
 
 ## declare constants
 
-N_CLASSES = 1
-HEIGHT, WIDTH, CHANNELS = 256, 256, 3
-BATCH_SIZE = 128
+const N_CLASSES = 1
+const HEIGHT, WIDTH, CHANNELS = 256, 256, 3
+const BATCH_SIZE = 64
 
 ## create data containers and dataloaders
 
-dataset_dir = "load_dataset/dataset/"
-train_dir = dataset_dir * "train/"
-test_dir = dataset_dir * "test/"
+const dataset_dir = "load_dataset/dataset/"
+const train_dir = dataset_dir * "train/"
+const test_dir = dataset_dir * "test/"
 
 # dataframes containing filenames for images and corresponding labels
-train_df = DataFrame(CSV.File(dataset_dir * "train_labels.csv"))
-test_df = DataFrame(CSV.File(dataset_dir * "test_labels.csv"))
+const train_df = DataFrame(CSV.File(dataset_dir * "train_labels.csv"))
+const test_df = DataFrame(CSV.File(dataset_dir * "test_labels.csv"))
 
 # ImageDataContainer wrappers for dataframes
 # gives interface for getting the actual images and labels as tensors
-train_dataset = ImageDataContainer(train_df, train_dir)
-test_dataset = ImageDataContainer(test_df, test_dir)
+const train_dataset = ImageDataContainer(train_df, train_dir)
+const test_dataset = ImageDataContainer(test_df, test_dir)
 
 # randomly sort train dataset into training and validation sets
-train_set, val_set = splitobs(train_dataset, at=0.7, shuffle=true)
+const train_set, val_set = splitobs(train_dataset, at=0.7, shuffle=true)
 
-train_loader = DataLoader(train_set, batchsize=BATCH_SIZE, shuffle=true)
-val_loader = DataLoader(val_set, batchsize=BATCH_SIZE, shuffle=true)
-test_loader = DataLoader(test_dataset, batchsize=BATCH_SIZE)
+const train_loader = DataLoader(train_set, batchsize=BATCH_SIZE, shuffle=true)
+const val_loader = DataLoader(val_set, batchsize=BATCH_SIZE, shuffle=true)
+const test_loader = DataLoader(test_dataset, batchsize=BATCH_SIZE)
 
 ## training loop
 
@@ -100,10 +100,10 @@ mutable struct TrainingMetrics
 end
 
 "Trains given model for a given number of epochs and saves the model that performs best on the validation set."
-function train(model, n_epochs::Integer)
+function train(model, n_epochs::Integer, filename::String)
     model = model |> gpu
     optimizer = ADAM()
-    params = Flux.params(model)
+    params = Flux.params(model[end]) # transfer learning, so only training last layers
 
     metrics = TrainingMetrics(n_epochs)
 
@@ -148,7 +148,7 @@ function train(model, n_epochs::Integer)
             # calculate the loss and accuracy for this batch, add to accumulator for epoch results
             batch_acc = @pipe ((((σ.(ŷ) .> 0.5) .* 1.0) .== y) .* 1.0) |> cpu |> reduce(+, _)
             epoch_acc += batch_acc
-            batch_loss = loss(X, y)
+            batch_loss = logitbinarycrossentropy(ŷ, y)
             epoch_loss += (batch_loss |> cpu)
 
             @logprogress batch_idx / length(enumerate(val_loader))
@@ -159,8 +159,8 @@ function train(model, n_epochs::Integer)
 
         # automatically save the model every time it improves in val accuracy
         if metrics.val_acc[epoch_idx] >= best_acc
-            @info "New best accuracy: $(metrics.val_acc[epoch_idx])! Saving model out to baseline.bson"
-            BSON.@save joinpath(@__DIR__, "baseline.bson")
+            @info "New best accuracy: $(metrics.val_acc[epoch_idx])! Saving model out to $(filename).bson"
+            BSON.@save joinpath(@__DIR__, "$(filename).bson")
             best_acc = metrics.val_acc[epoch_idx]
         end
     end
@@ -181,12 +181,12 @@ baseline_model = Chain(
     resnet.layers[1:end-1],
     Chain(
         AdaptiveMeanPool((1, 1)),
-        MLUtils.flatten,
+        Flux.flatten,
         Dense(512 => N_CLASSES)
     )
 )
 
-baseline_model, baseline_metrics = @time train(baseline_model, 10)
+baseline_model, baseline_metrics = @time train(baseline_model, 10, "baseline")
 
 plot(baseline_metrics.val_acc, label="resnet18 baseline")
 xlabel!("Epoch")
@@ -197,12 +197,12 @@ savefig("baseline_val_accuracy.png")
 ## custom twin-network model
 
 # need two dataloaders for each stage, as need two images to feed into the twin network model
-train_loader₁ = DataLoader(train_set, batchsize=BATCH_SIZE, shuffle=true)
-train_loader₂ = DataLoader(train_set, batchsize=BATCH_SIZE, shuffle=true)
-val_loader₁ = DataLoader(val_set, batchsize=BATCH_SIZE, shuffle=true)
-val_loader₂ = DataLoader(val_set, batchsize=BATCH_SIZE, shuffle=true)
-test_loader₁ = DataLoader(test_dataset, batchsize=BATCH_SIZE, shuffle=true)
-test_loader₂ = DataLoader(test_dataset, batchsize=BATCH_SIZE, shuffle=true)
+const train_loader₁ = DataLoader(train_set, batchsize=BATCH_SIZE, shuffle=true)
+const train_loader₂ = DataLoader(train_set, batchsize=BATCH_SIZE, shuffle=true)
+const val_loader₁ = DataLoader(val_set, batchsize=BATCH_SIZE, shuffle=true)
+const val_loader₂ = DataLoader(val_set, batchsize=BATCH_SIZE, shuffle=true)
+const test_loader₁ = DataLoader(test_dataset, batchsize=BATCH_SIZE, shuffle=true)
+const test_loader₂ = DataLoader(test_dataset, batchsize=BATCH_SIZE, shuffle=true)
 
 "Custom Flux NN layer which will create twin network from `path` with shared parameters and combine their output with `combine`."
 struct Twin{T,F}
@@ -216,37 +216,36 @@ end
 Flux.@functor Twin
 (m::Twin)(Xs::Tuple) = m.combine(map(X -> m.path(X), Xs)...)
 
-# this is the architecture that forms the path of the twin network
-CNN_path = Chain(
-    # layer 1
-    Conv((5,5), 3 => 18, relu),
-    MaxPool((3,3), stride=3),
-    # layer 2
-    Conv((5,5), 18 => 36, relu),
-    MaxPool((2,2), stride=2),
-    # layer 3
-    Conv((3,3), 36 => 72, relu),
-    MaxPool((2,2), stride=2),
-    Flux.flatten,
-    # layer 4
-    Dense(19 * 19 * 72 => 64, relu),
-    # Dropout(0.1),
-    # output layer
-    Dense(64 => 32, relu)
+twin_model = Twin(
+    # this layer combines the outputs of the twin CNNs
+    Flux.Bilinear((32,32) => 1),
+    # this is the architecture that forms the path of the twin network
+    Chain(
+        # layer 1
+        Conv((5,5), 3 => 18, relu),
+        MaxPool((3,3), stride=3),
+        # layer 2
+        Conv((5,5), 18 => 36, relu),
+        MaxPool((2,2), stride=2),
+        # layer 3
+        Conv((3,3), 36 => 72, relu),
+        MaxPool((2,2), stride=2),
+        Flux.flatten,
+        # layer 4
+        Dense(19 * 19 * 72 => 64, relu),
+        # Dropout(0.1),
+        # output layer
+        Dense(64 => 32, relu)
+    )
 )
-
-# this layer combines the outputs of the twin CNNs
-bilinear = Flux.Bilinear((32,32) => 1)
-
-twin_model = Twin(bilinear, CNN_path)
 
 ## training loop
 
-"Trains given model for a given number of epochs and saves the model that performs best on the validation set."
-function train_twin(model, n_epochs::Integer)
+"Trains given twin model for a given number of epochs and saves the model that performs best on the validation set."
+function train(model::Twin, n_epochs::Integer, filename::String; is_resnet::Bool=false)
     model = model |> gpu
     optimizer = ADAM()
-    params = Flux.params(model)
+    params = is_resnet ? Flux.params(model.path[end:end], model.combine) : Flux.params(model) # if custom CNN, need to train all params
 
     metrics = TrainingMetrics(n_epochs)
 
@@ -314,8 +313,8 @@ function train_twin(model, n_epochs::Integer)
 
         # automatically save the model every time it improves in val accuracy
         if metrics.val_acc[epoch_idx] >= best_acc
-            @info "New best accuracy: $(metrics.val_acc[epoch_idx])! Saving model out to twin.bson"
-            BSON.@save joinpath(@__DIR__, "twin.bson")
+            @info "New best accuracy: $(metrics.val_acc[epoch_idx])! Saving model out to $(filename).bson"
+            BSON.@save joinpath(@__DIR__, "$(filename).bson")
             best_acc = metrics.val_acc[epoch_idx]
         end
     end
@@ -323,10 +322,32 @@ function train_twin(model, n_epochs::Integer)
     return model, metrics
 end
 
-twin_model, twin_metrics = @time train_twin(twin_model, 10)
+twin_model, twin_metrics = @time train(twin_model, 10, "twin_cnn")
 
-plot(twin_metrics.val_acc, label="twin network")
+plot(twin_metrics.val_acc, label="twin cnn")
 xlabel!("Epoch")
 ylabel!("Validation Accuracy")
 title!("Validation Accuracy vs Epochs")
-savefig("twin_val_accuracy.png")
+savefig("twin_cnn_val_accuracy.png")
+
+## twin resnet model
+
+twin_resnet = Twin(
+    Flux.Bilinear((32,32) => 1),
+    Chain(
+        resnet.layers[1:end-1],
+        Chain(
+            AdaptiveMeanPool((1, 1)),
+            Flux.flatten,
+            Dense(512 => 32)
+        )
+    )
+)
+
+twin_resnet, twin_resnet_metrics = @time train(twin_resnet, 10, "twin_resnet", is_resnet=true)
+
+plot(twin_resnet_metrics.val_acc, label="twin resnet")
+xlabel!("Epoch")
+ylabel!("Validation Accuracy")
+title!("Validation Accuracy vs Epochs")
+savefig("twin_resnet_val_accuracy.png")
